@@ -15,36 +15,24 @@ interface IDep {
 contract AutomatedWorkflow {
     using SafeERC20 for IERC20;
 
-    // Define state variables
+    struct Workflow {
+        address owner;
+        address destination;
+        bytes execData;
+        uint256 maxGasLimit;
+        uint256 prefund;
+        uint256 timestamp;
+        bool active;
+    }
+
     IDep private _dep;
+    mapping(uint256 => Workflow) private workflows;
+    uint256 private workflowCount;
     address private _owner;
 
-    mapping(address => mapping(uint256 => bool)) public activeWorkflows;
-    mapping(uint256 => bool) public workflowActiveStatus;
-    mapping(uint256 => uint256) public workflowTimestamps;
-    mapping(uint256 => uint256) public workflowMaxGasLimits;
-    mapping(uint256 => uint256) public workflowPrefunds;
-    mapping(address => mapping(uint256 => uint256)) public userPrefunds;
-    mapping(uint256 => address) public workflowDestinations;
-    mapping(uint256 => bytes) public workflowExecData;
-
-    event WorkflowRegistered(address indexed user, uint256 indexed workflowId);
-    event WorkflowActivated(address indexed user, uint256 indexed workflowId);
-    event WorkflowExecuted(
-        address indexed user,
-        uint256 indexed workflowId,
-        uint256 timestamp
-    );
-    event Prefunded(
-        address indexed user,
-        uint256 indexed workflowId,
-        uint256 amount
-    );
-    event PrefundWithdrawn(
-        address indexed user,
-        uint256 indexed workflowId,
-        uint256 amount
-    );
+    event WorkflowRegistered(uint256 indexed workflowId, address indexed owner);
+    event WorkflowExecuted(uint256 indexed workflowId, uint256 timestamp);
+    event PrefundWithdrawn(uint256 indexed workflowId, uint256 amount);
 
     constructor(IDep dep) {
         _dep = dep;
@@ -56,109 +44,106 @@ contract AutomatedWorkflow {
         _;
     }
 
-    modifier onlyActiveWorkflow(uint256 workflowId) {
-        require(workflowActiveStatus[workflowId], "Workflow is not active");
+    modifier onlyWorkflowOwner(uint256 workflowId) {
+        require(
+            workflows[workflowId].owner == msg.sender,
+            "Not the workflow owner"
+        );
         _;
     }
 
-    function register(
-        uint256 workflowId,
+    modifier onlyActiveWorkflow(uint256 workflowId) {
+        require(workflows[workflowId].active, "Workflow is not active");
+        _;
+    }
+
+    function registerWorkflow(
         address destination,
         bytes calldata data
     ) external {
-        address user = msg.sender;
-        require(
-            !activeWorkflows[user][workflowId],
-            "Workflow already registered"
-        );
+        workflowCount++;
+        workflows[workflowCount] = Workflow({
+            owner: msg.sender,
+            destination: destination,
+            execData: data,
+            maxGasLimit: 0,
+            prefund: 0,
+            timestamp: 0,
+            active: false
+        });
 
-        workflowDestinations[workflowId] = destination;
-        workflowExecData[workflowId] = data;
-
-        activeWorkflows[user][workflowId] = true;
-
-        emit WorkflowRegistered(user, workflowId);
+        emit WorkflowRegistered(workflowCount, msg.sender);
     }
 
-    function activate(
+    function activateWorkflow(
         uint256 workflowId,
         uint256 maxGasLimit
     ) external onlyOwner {
-        workflowTimestamps[workflowId] = block.timestamp;
-        workflowMaxGasLimits[workflowId] = maxGasLimit;
-        workflowActiveStatus[workflowId] = true;
-
-        emit WorkflowActivated(msg.sender, workflowId);
+        workflows[workflowId].maxGasLimit = maxGasLimit;
+        workflows[workflowId].timestamp = block.timestamp;
+        workflows[workflowId].active = true;
     }
 
-    function prefund(
+    function prefundAndRun(
         uint256 workflowId
-    ) external payable onlyActiveWorkflow(workflowId) {
-        require(
-            activeWorkflows[msg.sender][workflowId],
-            "Workflow is not registered by sender"
-        );
-
-        uint256 maxGasLimit = workflowMaxGasLimits[workflowId];
-        uint256 requiredPrefund = maxGasLimit * tx.gasprice;
-
+    )
+        external
+        payable
+        onlyActiveWorkflow(workflowId)
+        onlyWorkflowOwner(workflowId)
+    {
+        uint256 requiredPrefund = workflows[workflowId].maxGasLimit *
+            tx.gasprice;
         require(msg.value >= requiredPrefund, "Insufficient prefund amount");
 
-        userPrefunds[msg.sender][workflowId] += msg.value;
-        workflowPrefunds[workflowId] += msg.value;
-
-        emit Prefunded(msg.sender, workflowId, msg.value);
-    }
-
-    function run(uint256 workflowId) external onlyActiveWorkflow(workflowId) {
+        workflows[workflowId].prefund += msg.value;
         require(
-            block.timestamp >= workflowTimestamps[workflowId] + 1 days,
+            block.timestamp >= workflows[workflowId].timestamp + 1 days,
             "Too soon to run the workflow"
         );
 
-        require(workflowPrefunds[workflowId] > 0, "Insufficient prefund");
-
         uint256 initialGas = gasleft();
-        workflowTimestamps[workflowId] = block.timestamp;
+        workflows[workflowId].timestamp = block.timestamp;
 
-        address destination = workflowDestinations[workflowId];
-        bytes memory execData = workflowExecData[workflowId];
-
-        (bool success, ) = destination.call(execData);
+        (bool success, ) = workflows[workflowId].destination.call(
+            workflows[workflowId].execData
+        );
         require(success, "Execution failed");
 
         uint256 gasUsed = initialGas - gasleft();
         uint256 gasCost = gasUsed * tx.gasprice;
-
         require(
-            gasCost <= workflowPrefunds[workflowId],
+            gasCost <= workflows[workflowId].prefund,
             "Gas cost exceeds prefund"
         );
-        workflowPrefunds[workflowId] -= gasCost;
+
+        workflows[workflowId].prefund -= gasCost;
         payable(msg.sender).transfer(gasCost);
 
-        emit WorkflowExecuted(msg.sender, workflowId, block.timestamp);
+        emit WorkflowExecuted(workflowId, block.timestamp);
     }
 
     function cancelTask(uint256 workflowId) external onlyOwner {
-        workflowActiveStatus[workflowId] = false;
+        workflows[workflowId].active = false;
     }
 
     function setDEPAddress(IDep dep) external onlyOwner {
         _dep = dep;
     }
 
-    function withdrawPrefund(uint256 workflowId, uint256 amount) external {
+    function withdrawPrefund(
+        uint256 workflowId,
+        uint256 amount
+    ) external onlyWorkflowOwner(workflowId) {
         require(
-            userPrefunds[msg.sender][workflowId] >= amount,
+            workflows[workflowId].prefund >= amount,
             "Insufficient prefund"
         );
 
-        userPrefunds[msg.sender][workflowId] -= amount;
-        workflowPrefunds[workflowId] -= amount;
+        workflows[workflowId].prefund -= amount;
         payable(msg.sender).transfer(amount);
 
-        emit PrefundWithdrawn(msg.sender, workflowId, amount);
+        emit PrefundWithdrawn(workflowId, amount);
     }
 
     receive() external payable {}
