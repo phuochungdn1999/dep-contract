@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity >=0.8.0;
 
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -12,7 +13,14 @@ interface IDep {
     function cancelTask(bytes32 taskId) external;
 }
 
-contract AutomatedWorkflow {
+interface IProtocolFees {
+    function getDEPFee()
+        external
+        view
+        returns (uint256 depFixedFee, uint256 depFixedGas);
+}
+
+contract AutomatedWorkflow is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     struct Workflow {
@@ -26,6 +34,7 @@ contract AutomatedWorkflow {
     }
 
     IDep private _dep;
+    IProtocolFees private _protocolFees;
     mapping(uint256 => Workflow) private workflows;
     uint256 private workflowCount;
     address private _owner;
@@ -34,8 +43,9 @@ contract AutomatedWorkflow {
     event WorkflowExecuted(uint256 indexed workflowId, uint256 timestamp);
     event PrefundWithdrawn(uint256 indexed workflowId, uint256 amount);
 
-    constructor(IDep dep) {
+    constructor(IDep dep, IProtocolFees protocolFees) {
         _dep = dep;
+        _protocolFees = protocolFees;
         _owner = msg.sender;
     }
 
@@ -89,35 +99,38 @@ contract AutomatedWorkflow {
     )
         external
         payable
+        nonReentrant
         onlyActiveWorkflow(workflowId)
         onlyWorkflowOwner(workflowId)
     {
-        uint256 requiredPrefund = workflows[workflowId].maxGasLimit *
-            tx.gasprice;
+        Workflow storage workflow = workflows[workflowId];
+
+        (uint256 depFixedFee, uint256 depFixedGas) = _protocolFees.getDEPFee();
+        uint256 requiredPrefund = (workflow.maxGasLimit + depFixedGas) *
+            tx.gasprice +
+            depFixedFee;
+
         require(msg.value >= requiredPrefund, "Insufficient prefund amount");
 
-        workflows[workflowId].prefund += msg.value;
+        workflow.prefund += msg.value;
         require(
-            block.timestamp >= workflows[workflowId].timestamp + 1 days,
+            block.timestamp >= workflow.timestamp + 1 days,
             "Too soon to run the workflow"
         );
 
         uint256 initialGas = gasleft();
-        workflows[workflowId].timestamp = block.timestamp;
+        workflow.timestamp = block.timestamp;
 
-        (bool success, ) = workflows[workflowId].destination.call(
-            workflows[workflowId].execData
+        (bool success, ) = workflow.destination.call{gas: workflow.maxGasLimit}(
+            workflow.execData
         );
         require(success, "Execution failed");
 
-        uint256 gasUsed = initialGas - gasleft();
-        uint256 gasCost = gasUsed * tx.gasprice;
-        require(
-            gasCost <= workflows[workflowId].prefund,
-            "Gas cost exceeds prefund"
-        );
+        uint256 gasUsed = initialGas - gasleft() + depFixedGas;
+        uint256 gasCost = gasUsed * tx.gasprice + depFixedFee;
+        require(gasCost <= workflow.prefund, "Gas cost exceeds prefund");
 
-        workflows[workflowId].prefund -= gasCost;
+        workflow.prefund -= gasCost;
         payable(msg.sender).transfer(gasCost);
 
         emit WorkflowExecuted(workflowId, block.timestamp);
@@ -131,10 +144,16 @@ contract AutomatedWorkflow {
         _dep = dep;
     }
 
+    function setProtocolFeesAddress(
+        IProtocolFees protocolFees
+    ) external onlyOwner {
+        _protocolFees = protocolFees;
+    }
+
     function withdrawPrefund(
         uint256 workflowId,
         uint256 amount
-    ) external onlyWorkflowOwner(workflowId) {
+    ) external nonReentrant onlyWorkflowOwner(workflowId) {
         require(
             workflows[workflowId].prefund >= amount,
             "Insufficient prefund"
